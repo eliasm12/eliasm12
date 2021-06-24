@@ -4,6 +4,7 @@ from slack_bolt import App
 import mysql.connector
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+import json
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -36,6 +37,13 @@ def get_projectslackchannelsid_from_channelid(channel_id):
     mycursor = mydb.cursor()
     sql = """SELECT project_slack_channels_id FROM project_slack_channels where channel_id = %s"""
     mycursor.execute(sql , (channel_id,))
+    myresult = mycursor.fetchone()
+    return myresult[0]
+
+def get_user_id_from_username(username)
+    mycursor = mydb.cursor()
+    sql = """SELECT slack_user_id FROM users where username = %s"""
+    mycursor.execute(sql , (username,))
     myresult = mycursor.fetchone()
     return myresult[0]
 
@@ -102,6 +110,16 @@ def get_task_attribute(task_id,name):
     myresult = mycursor.fetchone()
     return myresult[0]            
 
+def list_channel_taks_table(myresult,task_status):
+    result = f"Tasks with Status : {task_status} \n"   
+    result += "ID         Severity        Name\n"
+    for x in myresult:
+        taskname = get_task_attribute(x[0],"task_name")
+        severity = get_task_attribute(x[0],"severity")
+        result += f"{x[0]}      {severity}      {taskname}\n"
+    return result
+
+
 def get_channel_tasks(channel_id,task_status,task_user):
     mycursor = mydb.cursor()
     if task_user == 'all':
@@ -110,13 +128,7 @@ def get_channel_tasks(channel_id,task_status,task_user):
         sql = """SELECT task_id FROM project_slack_channels AS a, tasks AS b where a.project_slack_channels_id = b.project_slack_channels_id AND task_status = %s AND channel_id = %s"""
     mycursor.execute(sql , (task_status,channel_id,))
     myresult = mycursor.fetchall()
-    result = f"Tasks with Status : {task_status} \n"   
-    result += "ID         Severity        Name\n"
-    for x in myresult:
-        taskname = get_task_attribute(x[0],"task_name")
-        severity = get_task_attribute(x[0],"severity")
-        result += f"{x[0]}      {severity}      {taskname}\n"
-    return result
+    return myresult
 
 def insert_track_cmd(task_id,cmd):
     mycursor = mydb.cursor()
@@ -126,6 +138,13 @@ def insert_track_cmd(task_id,cmd):
     #TODO check insert if succesful
     return mycursor.lastrowid
 
+def assign_user_task(task_id,user_id,assign_user):
+    mycursor = mydb.cursor()
+    sql = """INSERT INTO task_users (task_id,assigner,slack_user_id) VALUES (%s,%s,%s)"""
+    mycursor.execute(sql , (task_id,user_id,assign_user,))
+    mydb.commit()
+    #TODO check insert if succesful
+    return mycursor.lastrowid
 
 def track_task(task_id,channel_id,cmd):
     if check_task_in_channel_status(task_id,channel_id,'open'):
@@ -142,7 +161,12 @@ def check_task_in_channel_status(task_id,channel_id,task_status):
     sql = """SELECT task_id FROM project_slack_channels AS a, tasks AS b where a.project_slack_channels_id = b.project_slack_channels_id AND task_status = %s AND channel_id = %s AND task_id = %s"""
     mycursor.execute(sql , (task_status,channel_id,task_id))
     myresult = mycursor.fetchone()
-    return myresult[0]
+    try:
+        if myresult[0]:
+            return 1
+    except Exception as e:
+            return 0
+
 
 @app.command("/track")
 def handle_track_command(ack, body):
@@ -181,7 +205,7 @@ def handle_track_command(ack, body, logger):
     
     if task_user == '-all' or task_user == user_id:
         if task_status == "open" or task_status == "closed":
-            result = get_channel_tasks(channel_id,task_status,task_user)
+            result = list_channel_taks_table(get_channel_tasks(channel_id,task_status,task_user),task_status)
     else:
         result = "incorrect command usage, allowed values : open or closed \n To Display tasks from all users in this channel append : -all"
     chat_send_message_epthernal(channel_id,result,user_id)
@@ -281,11 +305,38 @@ def handle_create_command(body, ack, respond, client, logger):
     )
 
 
+
+
+@app.command("/assign")
+def handle_assign_command(ack, body, logger):
+    ack()
+    result="test"
+    channel_id = body["channel_id"]
+    command = body["text"]
+    user_id = body["user_id"]
+    command_chunks = command.split()
+    task_id_str = command_chunks[0]
+    if task_id_str.isnumeric():
+        task_id=int(task_id_str)
+        if check_task_in_channel_status(task_id,channel_id,'open'):
+            try:
+                if command_chunks[1]:
+                    username = command_chunks[1]
+                    assign_user_id = get_user_id_from_username(username)
+                    #TODO check if user allowed to receive tickets
+                    if assign_user_task(task_id,user_id,assign_user):
+                        result = "Assigned Task : {task_id} to {assign_user_id} By {user_id}"
+            except IndexError:
+                result = "Error use ' /list open -all ' to check open tickets and assign them /n command usage: /assign task_id @user"
+        else:
+            result = "Double check the Task ID \n you can use : ' /list open -all '"
+    chat_send_message_epthernal(channel_id,result,user_id)
+    logger.info(result)
+
+
 @app.action("static_select-action")
 def handle_severity_option(ack, body, logger):
     ack()
-
-
 
 @app.view("view-id")
 def view_submission(ack, body, logger):

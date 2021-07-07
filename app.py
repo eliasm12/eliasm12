@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from slack_bolt import App
 import mysql.connector
 from slack_sdk import WebClient
@@ -34,16 +35,26 @@ def log_request(logger, body, next):
     return next()
 
 def get_projectslackchannelsid_from_channelid(channel_id):
-    mycursor = mydb.cursor()
+    logging.info('+++++++++++++++++++++++++++++++++-------------channel_id')
+    logging.info(channel_id)
+    mycursor = mydb.cursor(buffered=True)
     sql = """SELECT project_slack_channels_id FROM project_slack_channels where channel_id = %s"""
     mycursor.execute(sql , (channel_id,))
     myresult = mycursor.fetchone()
+    logging.info(myresult[0])
     return myresult[0]
 
-def get_user_id_from_username(username)
+def get_user_id_from_username(username):
     mycursor = mydb.cursor()
     sql = """SELECT slack_user_id FROM users where username = %s"""
     mycursor.execute(sql , (username,))
+    myresult = mycursor.fetchone()
+    return myresult[0]
+
+def get_username_from_user_id(user_id):
+    mycursor = mydb.cursor()
+    sql = """SELECT username FROM users where slack_user_id = %s"""
+    mycursor.execute(sql , (user_id,))
     myresult = mycursor.fetchone()
     return myresult[0]
 
@@ -63,16 +74,26 @@ def insert_task_detail(task_id,name,value):
     #TODO try catch
     return 1    
 
+def insert_task_status(task_id,task_status,user_id):
+    mycursor = mydb.cursor()
+    sql = """INSERT INTO track_task_status (task_id,task_status,slack_user_id) VALUES (%s,%s,%s)"""
+    mycursor.execute(sql , (task_id,task_status,user_id,))
+    mydb.commit()
+    #TODO try catch
+    return 1    
+
 def create_task(task_name , severity , user_id,username, channel_id,task_description):
     project_slack_channels_id = get_projectslackchannelsid_from_channelid(channel_id)
 #check if project_id is present 
     if project_slack_channels_id:
+        #TODO check for duplicate task name
         task_id = insert_create_task(project_slack_channels_id,user_id)
         if task_id:
+            set_task_status = insert_task_status(task_id,'open',user_id)
             res_task_name = insert_task_detail(task_id,"task_name",task_name)
             res_severity = insert_task_detail(task_id,"severity",severity)
             res_desc = insert_task_detail(task_id,"task_description",task_description)
-            if res_task_name and res_severity and res_desc:
+            if res_task_name and res_severity and res_desc and set_task_status:
                 return f"Created Ticket: {task_name} TicketID: {task_id} By: {username} with Severity Level: {severity}"
             else:
                 return "Error creating Ticket details"
@@ -114,26 +135,58 @@ def list_channel_taks_table(myresult,task_status):
     result = f"Tasks with Status : {task_status} \n"   
     result += "ID         Severity        Name\n"
     for x in myresult:
-        taskname = get_task_attribute(x[0],"task_name")
-        severity = get_task_attribute(x[0],"severity")
-        result += f"{x[0]}      {severity}      {taskname}\n"
+        if get_task_latest_status(x[0]) == task_status:
+            taskname = get_task_attribute(x[0],"task_name")
+            severity = get_task_attribute(x[0],"severity")
+            result += f"{x[0]}      {severity}      {taskname}\n"
     return result
 
 
-def get_channel_tasks(channel_id,task_status,task_user):
-    mycursor = mydb.cursor()
-    if task_user == 'all':
-        sql = """SELECT task_id FROM project_slack_channels AS a, tasks AS b where a.project_slack_channels_id = b.project_slack_channels_id AND task_status = %s AND channel_id = %s"""
-    else:
-        sql = """SELECT task_id FROM project_slack_channels AS a, tasks AS b where a.project_slack_channels_id = b.project_slack_channels_id AND task_status = %s AND channel_id = %s"""
-    mycursor.execute(sql , (task_status,channel_id,))
+def get_channel_tasks(channel_id):
+    mycursor = mydb.cursor(buffered=True)
+    sql = """
+        SELECT DISTINCT tasks.task_id 
+        FROM (tasks
+        INNER JOIN project_slack_channels ON tasks.project_slack_channels_id = project_slack_channels.project_slack_channels_id)
+        WHERE project_slack_channels.channel_id = %s 
+        """
+    mycursor.execute(sql , (channel_id,))
     myresult = mycursor.fetchall()
     return myresult
 
-def insert_track_cmd(task_id,cmd):
+def get_task_latest_status(task_id):
+    mycursor = mydb.cursor(buffered=True)
+    sql = """
+    SELECT task_id,task_status
+    FROM track_task_status
+    WHERE task_id = %s
+    ORDER BY track_task_status_id DESC
+          """
+    mycursor.execute(sql , (task_id,))
+    myresult = mycursor.fetchone()
+    return myresult[1]
+
+
+def get_track_latest_status(task_id,user_id):
+    mycursor = mydb.cursor(buffered=True)
+    sql = """
+    SELECT cmd
+    FROM task_track
+    WHERE task_id = %s AND user_id = %s
+    ORDER BY task_track DESC
+          """
+    mycursor.execute(sql , (task_id,user_id,))
+    myresult = mycursor.fetchone()
+    try:
+        logging.info(myresult[0])
+        return myresult[0]
+    except:
+        return 0
+
+def insert_track_cmd(task_id,cmd,user_id):
     mycursor = mydb.cursor()
-    sql = """INSERT INTO task_track (task_id,cmd) VALUES (%s,%s)"""
-    mycursor.execute(sql , (task_id,cmd,))
+    sql = """INSERT INTO task_track (task_id,cmd,user_id) VALUES (%s,%s,%s)"""
+    mycursor.execute(sql , (task_id,cmd,user_id,))
     mydb.commit()
     #TODO check insert if succesful
     return mycursor.lastrowid
@@ -146,30 +199,36 @@ def assign_user_task(task_id,user_id,assign_user):
     #TODO check insert if succesful
     return mycursor.lastrowid
 
-def track_task(task_id,channel_id,cmd):
-    if check_task_in_channel_status(task_id,channel_id,'open'):
+def track_task(task_id,channel_id,cmd,user_id):
+    if get_task_latest_status(task_id) == 'open':
         #TODO check if there was a stop or no previous request to track task b4 start
-        if insert_track_cmd(task_id,cmd):
-            return 1
+        logging.info(get_track_latest_status(task_id,user_id))
+        if get_track_latest_status(task_id,user_id) != cmd:
+            if insert_track_cmd(task_id,cmd,user_id):
+                return 1
+            else:
+                return 0
         else:
             return 0
     else:
         return 0
 
-def check_task_in_channel_status(task_id,channel_id,task_status):
-    mycursor = mydb.cursor()
-    sql = """SELECT task_id FROM project_slack_channels AS a, tasks AS b where a.project_slack_channels_id = b.project_slack_channels_id AND task_status = %s AND channel_id = %s AND task_id = %s"""
-    mycursor.execute(sql , (task_status,channel_id,task_id))
-    myresult = mycursor.fetchone()
-    try:
-        if myresult[0]:
-            return 1
-    except Exception as e:
-            return 0
 
+def get_started_tasks_task_id(user_id):
+    mycursor = mydb.cursor(buffered=True)
+    sql = """
+    SELECT task_id
+    FROM task_track
+    WHERE user_id = %s
+    ORDER BY task_track DESC
+          """
+    mycursor.execute(sql , (user_id,))
+    myresult = mycursor.fetchall()
+    return myresult
 
 @app.command("/track")
 def handle_track_command(ack, body):
+    user_id = body["user_id"]
     channel_name = body["channel_name"]
     channel_id = body["channel_id"]
     command = body["text"]
@@ -179,10 +238,10 @@ def handle_track_command(ack, body):
     if task_id_str.isnumeric():
         task_id=int(task_id_str)
         if track_com == "start" or track_com == "stop": 
-                if track_task(task_id,channel_id,track_com):
+                if track_task(task_id,channel_id,track_com,user_id):
                     ack(f"Tracking {track_com} for {channel_name} and task ID: {task_id}")
                 else:
-                    ack("Error!")
+                    ack("Error! please check if task is open and if its already being tracked")
         else:
             ack(f"🤬 incorrect command usage , please use either start or stop to track task time")
     else:
@@ -202,14 +261,29 @@ def handle_track_command(ack, body, logger):
             task_user = command_chunks[1]
     except IndexError:
         task_user = user_id
-    
-    if task_user == '-all' or task_user == user_id:
-        if task_status == "open" or task_status == "closed":
-            result = list_channel_taks_table(get_channel_tasks(channel_id,task_status,task_user),task_status)
-    else:
-        result = "incorrect command usage, allowed values : open or closed \n To Display tasks from all users in this channel append : -all"
+    result = "incorrect command usage, allowed values : open or closed \n To Display tasks from all users in this channel append : -all"
+    if task_status == "open" or task_status == "closed":
+        if task_user == '-all':
+                result = list_channel_taks_table(get_channel_tasks(channel_id),task_status)
+        elif task_user == user_id:
+                result = "currently not supported yet , please use -all"
     chat_send_message_epthernal(channel_id,result,user_id)
     logger.info(result)
+
+
+
+@app.command("/current")
+def handle_time_command(ack, body, logger):
+    ack()
+    channel_id = body["channel_id"]
+    command = body["text"]
+    user_id = body["user_id"]
+    command_chunks = command.split()
+    result = "incorrect command usage, \n To Display open tasks tracks for this channel use : `/current`"
+    result= get_started_tasks(user_id)
+    chat_send_message_epthernal(channel_id,result,user_id)
+    logger.info(result)
+
 
 
 @app.command("/create")
@@ -314,23 +388,59 @@ def handle_assign_command(ack, body, logger):
     channel_id = body["channel_id"]
     command = body["text"]
     user_id = body["user_id"]
+    cusername = body["user_name"]
     command_chunks = command.split()
     task_id_str = command_chunks[0]
     if task_id_str.isnumeric():
         task_id=int(task_id_str)
-        if check_task_in_channel_status(task_id,channel_id,'open'):
+        if get_task_latest_status(task_id) == 'open':
             try:
                 if command_chunks[1]:
-                    username = command_chunks[1]
+                    username = command_chunks[1].replace("@","")
                     assign_user_id = get_user_id_from_username(username)
-                    #TODO check if user allowed to receive tickets
-                    if assign_user_task(task_id,user_id,assign_user):
-                        result = "Assigned Task : {task_id} to {assign_user_id} By {user_id}"
+                    #TODO check if user allowed to receive tickets also make sure that this ticket was not previously assigned to him
+                    if assign_user_task(task_id,user_id,assign_user_id):
+                        task_name = get_task_attribute(task_id,"task_name");
+                        result = f"Assigned Task {task_id} : {task_name} to {command_chunks[1]} By {cusername}"
             except IndexError:
                 result = "Error use ' /list open -all ' to check open tickets and assign them /n command usage: /assign task_id @user"
         else:
-            result = "Double check the Task ID \n you can use : ' /list open -all '"
-    chat_send_message_epthernal(channel_id,result,user_id)
+            result = "Double check the Task ID and if it was still open \n you can use : ' /list open -all '"
+    chat_send_message(channel_id,result)
+    logger.info(result)
+
+
+@app.command("/resolve")
+def handle_close_command(ack, body, logger):
+    ack()
+    result="test"
+    channel_id = body["channel_id"]
+    command = body["text"]
+    user_id = body["user_id"]
+    cusername = body["user_name"]
+    command_chunks = command.split()
+    task_id_str = command_chunks[0]
+    error = 1 
+    if task_id_str.isnumeric():
+        task_id=int(task_id_str)
+        if get_task_latest_status(task_id) == 'open':
+            try:
+                if command_chunks[1]:
+                    comment = body["text"]
+                    if insert_task_status(task_id,'closed',user_id):
+                        task_name = get_task_attribute(task_id,"task_name");
+                        result = f"Task closed {task_id} : {task_name} \n Reason: {comment} By {cusername}"
+                        error = 0
+            except IndexError:
+                result = "Error Please Add Comment \n command usage: /resolve task_id comment)"
+        else:
+            result = "Error Task ID dont seem to be still open or valid \n you can use : ' /list open -all ' to check opened ones"
+    else:
+        result = "Error check command usage \n command usage: /resolve task_id comment "
+    if error == 0:
+        chat_send_message(channel_id,result)
+    else:
+        chat_send_message_epthernal(channel_id,result)
     logger.info(result)
 
 
@@ -344,6 +454,7 @@ def view_submission(ack, body, logger):
     user_id = body["user"]["id"]
     username= body["user"]["username"]
     channel_id = body["view"]["private_metadata"]
+    logger.info(channel_id)
     arrval = body["view"]["state"]["values"]
     task_name_key = next(iter(arrval["task_name"]))
     task_name = arrval["task_name"][task_name_key]["value"]
@@ -351,6 +462,7 @@ def view_submission(ack, body, logger):
     task_description = arrval["task_description"][task_description_key]["value"]
     severity = arrval["severity"]["static_select-action"]["selected_option"]["value"]
     ack()
+    logger.info("b4create***************************")
     result = create_task(task_name , severity , user_id,username, channel_id,task_description)
     chat_send_message(channel_id,result)
     logger.info(result)
